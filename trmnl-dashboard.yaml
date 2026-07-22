@@ -2,28 +2,38 @@ substitutions:
   name: "trmnl-dashboard"
   friendly_name: "TRMNL Dashboard"
 
-  # Render server — see foolaiserver's Flask/Playwright service. Host/port only,
-  # nothing else here should assume anything about how that service is deployed.
+  # Render server host/port (see ESP32-eink-server).
   render_host: "192.168.50.176"
   render_port: "8000"
 
-  # Server now routes images per-device (was a single shared /image.png).
-  # This device's id, as registered on the render server — see secrets.yaml.
+  # This device's id on the render server, set in secrets.yaml.
   device_id: !secret device_id
   image_path: "/image/${device_id}.png"
 
-  # How long to deep-sleep between refreshes. Change freely.
-  sleep_duration: "10min"
+  # Time between refreshes.
+  sleep_duration: "60min"
 
-  # Hard cap on awake time: if Wi-Fi or the HTTP fetch hangs, force a clean
-  # deep_sleep after this long rather than retrying/backing off. The whole
-  # point of this device is minimal awake time, so a bad wake just tries
-  # again next cycle instead of lingering.
+  # Max time to stay awake. If Wi-Fi or the image fetch hangs, sleep anyway
+  # instead of retrying — it'll just try again next cycle.
   awake_timeout: "25s"
+
+  # Extra awake time after a fresh flash/reset/power-cycle, so there's a
+  # window to reflash over USB before it goes back to sleep.
+  cold_boot_awake_time: "60s"
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  on_boot:
+    then:
+      - lambda: |-
+          id(is_cold_boot) = esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
+
+globals:
+  - id: is_cold_boot
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
 # TRMNL 7.5" (OG) DIY Kit — XIAO ESP32-S3 Plus driver board.
 # Pins/model per Seeed's official ESPHome cookbook:
@@ -33,9 +43,8 @@ esp32:
   framework:
     type: arduino
 
-# Board ships with octal PSRAM — required headroom for online_image to hold
-# both the downloaded PNG and its decoded 1bpp framebuffer (800x480 = 48000
-# bytes decoded, plus PNG decode scratch space).
+# Needed for online_image to have enough RAM for the PNG and its decoded
+# framebuffer.
 psram:
   mode: octal
   speed: 80MHz
@@ -49,47 +58,81 @@ wifi:
   fast_connect: true # connect straight to the known SSID, skip AP scan
   power_save_mode: none # keep the radio fully up for the short awake window
   on_connect:
-    # Fire the image fetch the instant we have a link — don't wait on a
-    # polling interval, and don't do anything else with this awake window.
-    - component.update: dashboard_image
-
-# No `api:` component: this device has no Home Assistant entities to expose
-# and is fully driven by the render server. Add it back only if you want to
-# expose sensors/controls to HA — it'll cost extra awake time and RAM.
-
-ota:
-  platform: esphome
-  password: !secret ota_password
+    # Battery sense divider is behind a load switch that's normally off —
+    # switch it on, give it a moment to settle, then read it.
+    - output.turn_on: battery_switch
+    - delay: 10ms
+    - component.update: battery_voltage
+    - output.turn_off: battery_switch
+    - logger.log:
+        level: INFO
+        format: "battery: raw ADC = %.3fV (pre-multiply), calibrated = %.1f%%"
+        args:
+          ["id(battery_voltage).get_raw_state()", "id(battery_voltage).state"]
+    - online_image.set_url:
+        id: dashboard_image
+        url: !lambda |-
+          return std::string("http://${render_host}:${render_port}${image_path}")
+              + "?battery=" + std::to_string(int(id(battery_voltage).state));
+    # On a cold boot, stay awake a bit longer instead of sleeping right
+    # after the fetch below, so there's time to reflash. Normal wake-ups
+    # skip this entirely.
+    - if:
+        condition:
+          lambda: "return id(is_cold_boot);"
+        then:
+          - deep_sleep.prevent: deep_sleep_1
+          - delay: ${cold_boot_awake_time}
+          - deep_sleep.enter: deep_sleep_1
 
 http_request:
   verify_ssl: false
-  timeout:
-    15s # normal fail-fast path: on_error fires ~here if the
-    # render server is unreachable/slow, then we sleep
-  watchdog_timeout:
-    40s # true last-resort safety net (should basically
-    # never trigger — awake_timeout's deep_sleep should
-    # win first)
+  timeout: 15s # fail fast if the render server is unreachable/slow
+  watchdog_timeout: 40s # last-resort safety net, shouldn't normally trigger
+
+# GPIO1 is the battery ADC, GPIO6 enables the sense divider (see Seeed's
+# Seeed_TRMNL_Eink_Project firmware — the divider reads ~0V unless GPIO6
+# is driven high first).
+output:
+  - platform: gpio
+    pin: GPIO6
+    id: battery_switch
+
+sensor:
+  - platform: adc
+    pin: GPIO1
+    id: battery_voltage
+    attenuation: 12db
+    update_interval: never
+    filters:
+      - multiply: 2.0
+      - calibrate_linear:
+          - 3.27 -> 0.0
+          - 4.15 -> 100.0
+      - clamp:
+          min_value: 0.0
+          max_value: 100.0
 
 online_image:
   - id: dashboard_image
     url: "http://${render_host}:${render_port}${image_path}"
     format: PNG
-    # OPEN DECISION — see README "Dithering" section: the render server
-    # doesn't dither to 1-bit yet, and `online_image` has no `dither` option
-    # (only the *local* `image:` component supports one), so BINARY here
-    # means a naive per-pixel threshold, not real dithering. Acceptable for
-    # now; revisit once the server does Floyd–Steinberg before serving PNGs.
     type: BINARY
-    update_interval:
-      never # never poll on a timer — only ever triggered by
-      # wifi.on_connect above
+    update_interval: never # only triggered from wifi.on_connect above
     on_download_finished:
       - component.update: main_display
-      - deep_sleep.enter: deep_sleep_1
+      - if:
+          condition:
+            lambda: "return !id(is_cold_boot);"
+          then:
+            - deep_sleep.enter: deep_sleep_1
     on_error:
       - logger.log: "image fetch failed — sleeping, will retry next wake"
-      - deep_sleep.enter: deep_sleep_1
+      - if:
+          condition:
+            lambda: "return !id(is_cold_boot);"
+          then:
+            - deep_sleep.enter: deep_sleep_1
 
 spi:
   clk_pin: GPIO7
