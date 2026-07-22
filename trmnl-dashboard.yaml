@@ -1,0 +1,111 @@
+substitutions:
+  name: "trmnl-dashboard"
+  friendly_name: "TRMNL Dashboard"
+
+  # Render server — see foolaiserver's Flask/Playwright service. Host/port only,
+  # nothing else here should assume anything about how that service is deployed.
+  render_host: "192.168.50.176"
+  render_port: "8000"
+  image_path: "/image.png"
+
+  # How long to deep-sleep between refreshes. Change freely.
+  sleep_duration: "10min"
+
+  # Hard cap on awake time: if Wi-Fi or the HTTP fetch hangs, force a clean
+  # deep_sleep after this long rather than retrying/backing off. The whole
+  # point of this device is minimal awake time, so a bad wake just tries
+  # again next cycle instead of lingering.
+  awake_timeout: "25s"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+# TRMNL 7.5" (OG) DIY Kit — XIAO ESP32-S3 Plus driver board.
+# Pins/model per Seeed's official ESPHome cookbook:
+# https://wiki.seeedstudio.com/ogdiy_kit_works_with_esphome/
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+
+# Board ships with octal PSRAM — required headroom for online_image to hold
+# both the downloaded PNG and its decoded 1bpp framebuffer (800x480 = 48000
+# bytes decoded, plus PNG decode scratch space).
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true # connect straight to the known SSID, skip AP scan
+  power_save_mode: none # keep the radio fully up for the short awake window
+  on_connect:
+    # Fire the image fetch the instant we have a link — don't wait on a
+    # polling interval, and don't do anything else with this awake window.
+    - component.update: dashboard_image
+
+# No `api:` component: this device has no Home Assistant entities to expose
+# and is fully driven by the render server. Add it back only if you want to
+# expose sensors/controls to HA — it'll cost extra awake time and RAM.
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+http_request:
+  verify_ssl: false
+  timeout:
+    15s # normal fail-fast path: on_error fires ~here if the
+    # render server is unreachable/slow, then we sleep
+  watchdog_timeout:
+    40s # true last-resort safety net (should basically
+    # never trigger — awake_timeout's deep_sleep should
+    # win first)
+
+online_image:
+  - id: dashboard_image
+    url: "http://${render_host}:${render_port}${image_path}"
+    format: PNG
+    # OPEN DECISION — see README "Dithering" section: the render server
+    # doesn't dither to 1-bit yet, and `online_image` has no `dither` option
+    # (only the *local* `image:` component supports one), so BINARY here
+    # means a naive per-pixel threshold, not real dithering. Acceptable for
+    # now; revisit once the server does Floyd–Steinberg before serving PNGs.
+    type: BINARY
+    update_interval:
+      never # never poll on a timer — only ever triggered by
+      # wifi.on_connect above
+    on_download_finished:
+      - component.update: main_display
+      - deep_sleep.enter: deep_sleep_1
+    on_error:
+      - logger.log: "image fetch failed — sleeping, will retry next wake"
+      - deep_sleep.enter: deep_sleep_1
+
+spi:
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+
+display:
+  - platform: waveshare_epaper
+    id: main_display
+    model: 7.50inv2
+    cs_pin: GPIO44
+    dc_pin: GPIO10
+    reset_pin: GPIO38
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    update_interval: never # only ever redrawn from online_image's callback
+    lambda: |-
+      it.image(0, 0, id(dashboard_image));
+
+deep_sleep:
+  id: deep_sleep_1
+  run_duration: ${awake_timeout}
+  sleep_duration: ${sleep_duration}
