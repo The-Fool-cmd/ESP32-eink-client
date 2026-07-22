@@ -13,9 +13,14 @@ substitutions:
   # Time between refreshes.
   sleep_duration: "60min"
 
-  # Max time to stay awake. If Wi-Fi or the image fetch hangs, sleep anyway
-  # instead of retrying — it'll just try again next cycle.
-  awake_timeout: "25s"
+  # Max time to stay awake. Needs headroom above http_request's timeout
+  # times max_fetch_retries below, plus Wi-Fi connect and display draw time.
+  awake_timeout: "220s"
+
+  # Retry the image fetch this many times (same wake cycle) before giving
+  # up and waiting for the next one. Trades battery for a better shot at
+  # surviving transient packet loss instead of a wasted hour-long cycle.
+  max_fetch_retries: "3"
 
   # Extra awake time after a fresh flash/reset/power-cycle, so there's a
   # window to reflash over USB before it goes back to sleep.
@@ -34,6 +39,10 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  - id: fetch_attempt
+    type: int
+    restore_value: false
+    initial_value: "0"
 
 # TRMNL 7.5" (OG) DIY Kit — XIAO ESP32-S3 Plus driver board.
 # Pins/model per Seeed's official ESPHome cookbook:
@@ -87,8 +96,8 @@ wifi:
 
 http_request:
   verify_ssl: false
-  timeout: 15s # fail fast if the render server is unreachable/slow
-  watchdog_timeout: 40s # last-resort safety net, shouldn't normally trigger
+  timeout: 45s # render server can be genuinely slow, not just unreachable
+  watchdog_timeout: 240s # last-resort safety net, above awake_timeout
 
 # GPIO1 is the battery ADC, GPIO6 enables the sense divider (see Seeed's
 # Seeed_TRMNL_Eink_Project firmware — the divider reads ~0V unless GPIO6
@@ -127,12 +136,23 @@ online_image:
           then:
             - deep_sleep.enter: deep_sleep_1
     on_error:
-      - logger.log: "image fetch failed — sleeping, will retry next wake"
+      - lambda: "id(fetch_attempt) += 1;"
       - if:
           condition:
-            lambda: "return !id(is_cold_boot);"
+            lambda: "return id(fetch_attempt) <= ${max_fetch_retries};"
           then:
-            - deep_sleep.enter: deep_sleep_1
+            - logger.log:
+                format: "image fetch failed, retrying (%d/${max_fetch_retries})"
+                args: ["id(fetch_attempt)"]
+            - delay: 3s
+            - component.update: dashboard_image
+          else:
+            - logger.log: "image fetch failed too many times — sleeping, will retry next wake"
+            - if:
+                condition:
+                  lambda: "return !id(is_cold_boot);"
+                then:
+                  - deep_sleep.enter: deep_sleep_1
 
 spi:
   clk_pin: GPIO7

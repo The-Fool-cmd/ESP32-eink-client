@@ -58,7 +58,12 @@ stays awake briefly per cycle, so it's not reliably reachable for OTA:
 
 ```
 esphome compile trmnl-dashboard.yaml
+```
+```
 esphome upload trmnl-dashboard.yaml --device /dev/ttyACMx
+```
+```
+esphome logs trmnl-dashboard.yaml --device /dev/ttyACMx
 ```
 
 (`esphome run` does both in one go, but compiling first means the upload
@@ -81,7 +86,9 @@ Everything tunable lives in the `substitutions:` block at the top of
 
 - `render_host` / `render_port` / `image_path` — where to fetch the PNG from.
 - `sleep_duration` — time between refreshes.
-- `awake_timeout` — hard cap on awake time per cycle. If Wi-Fi or the fetch
-  hangs, the device sleeps anyway rather than retrying.
+- `awake_timeout` — hard cap on awake time per cycle, sized to cover
+  `max_fetch_retries` worth of retries plus Wi-Fi connect/display draw time.
+- `max_fetch_retries` — how many times to retry a failed image fetch within
+  the same wake cycle before giving up until the next one.
 - `cold_boot_awake_time` — extra awake time after a fresh flash/reset, to
   leave room for reflashing.
