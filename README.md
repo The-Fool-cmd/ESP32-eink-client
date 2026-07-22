@@ -24,6 +24,8 @@ cp secrets.yaml.example secrets.yaml   # already done locally; edit with real va
 Fill in `secrets.yaml`:
 - `wifi_ssid` / `wifi_password`
 - `ota_password` — used for future OTA updates
+- `device_id` — this device's id as registered on the render server (used to
+  build the per-device image URL, e.g. `/image/<device_id>.png`)
 
 First flash must be over USB (`esphome run trmnl-dashboard.yaml`). Subsequent
 updates can go over OTA once the device is on the network — though note this
@@ -35,8 +37,11 @@ wake cycle to catch it (see `awake_timeout` below).
 All in the `substitutions:` block at the top of `trmnl-dashboard.yaml`:
 
 - `render_host` / `render_port` / `image_path` — where to fetch the PNG from.
-  Defaults to `foolaiserver:8000/image.png`. Nothing else in this config
-  assumes anything about how that service is deployed beyond host:port.
+  Server now routes per-device (`/image/<device_id>.png` instead of a single
+  shared `/image.png`); `device_id` itself lives in `secrets.yaml` (see
+  Setup above) and is pulled in via `!secret`, not hardcoded here. Nothing
+  else in this config assumes anything about how that service is deployed
+  beyond host:port.
 - `sleep_duration` — time between refreshes (default 10min).
 - `awake_timeout` — hard cap on awake time per cycle (default 25s). If Wi-Fi
   or the HTTP fetch hangs, the device force-sleeps after this long rather than
@@ -68,6 +73,24 @@ Recommend (1), since it keeps the firmware dumb (matches the "server decides
 what's on screen" design) and gives more control over the dither algorithm.
 Not implemented here — flagging for a decision before spending more time on
 either side.
+
+## Open decision: battery indicator
+
+The render server accepts an optional `?battery=<0-100>` query param on the
+image request and draws a small battery glyph if present. No battery sensor
+is configured in this file yet — `image_path`'s URL has no query string, so
+the server just omits the indicator, which is fine as a default.
+
+To wire it up, this repo would need a `sensor:` block reading the battery
+ADC, then `online_image`'s `url:` would switch from a plain substitution to
+a `lambda` appending `"?battery=" + to_string(int(id(battery_percent).state))`.
+Seeed's cookbook for this exact board (XIAO ESP32-S3 Plus) documents a
+battery voltage sensor on **GPIO1** (`platform: adc`, `attenuation: 12db`,
+`multiply: 2.0` to undo an onboard divider) plus a calibration curve mapping
+~3.27V–4.15V to 0–100%. Whether that's worth adding depends on whether this
+particular board was actually built/wired with the battery ADC tap — not
+all DIY kit assemblies populate it. Not implemented here; flagging for a
+decision once that's confirmed.
 
 ## Why no `api:` component
 

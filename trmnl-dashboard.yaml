@@ -6,7 +6,11 @@ substitutions:
   # nothing else here should assume anything about how that service is deployed.
   render_host: "192.168.50.176"
   render_port: "8000"
-  image_path: "/image.png"
+
+  # Server now routes images per-device (was a single shared /image.png).
+  # This device's id, as registered on the render server — see secrets.yaml.
+  device_id: !secret device_id
+  image_path: "/image/${device_id}.png"
 
   # How long to deep-sleep between refreshes. Change freely.
   sleep_duration: "10min"
