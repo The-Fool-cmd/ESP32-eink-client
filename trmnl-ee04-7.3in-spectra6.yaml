@@ -14,7 +14,7 @@ substitutions:
   image_path: "/image/${device_id}.png"
 
   # Time between refreshes.
-  sleep_duration: "1min"
+  sleep_duration: "60min"
 
   # Max time to stay awake. Needs headroom above http_request's timeout
   # times max_fetch_retries below, plus Wi-Fi connect, display draw time,

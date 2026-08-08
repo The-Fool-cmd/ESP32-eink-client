@@ -1,13 +1,16 @@
 substitutions:
-  name: "trmnl-dashboard"
-  friendly_name: "TRMNL Dashboard"
+  # This device's id on the render server, set in secrets.yaml. Also
+  # doubles as the ESPHome name/hostname below, so keep it hostname-safe
+  # (lowercase letters, digits, hyphens only) — one place to rename a
+  # device instead of three.
+  device_id: !secret device_id
+  name: "trmnl-${device_id}"
+  friendly_name: "TRMNL ${device_id}"
 
   # Render server host/port (see ESP32-eink-server).
   render_host: "192.168.50.176"
   render_port: "8000"
 
-  # This device's id on the render server, set in secrets.yaml.
-  device_id: !secret device_id
   image_path: "/image/${device_id}.png"
 
   # Time between refreshes.
@@ -15,11 +18,11 @@ substitutions:
 
   # Max time to stay awake. Needs headroom above http_request's timeout
   # times max_fetch_retries below, plus Wi-Fi connect and display draw time.
-  awake_timeout: "220s"
+  awake_timeout: "90s"
 
   # Retry the image fetch this many times (same wake cycle) before giving
-  # up and waiting for the next one. Trades battery for a better shot at
-  # surviving transient packet loss instead of a wasted hour-long cycle.
+  # up and waiting for the next one. Fail fast per attempt and retry rather
+  # than sit on one slow request.
   max_fetch_retries: "3"
 
   # Extra awake time after a fresh flash/reset/power-cycle, so there's a
@@ -50,7 +53,7 @@ globals:
 esp32:
   board: esp32-s3-devkitc-1
   framework:
-    type: arduino
+    type: esp-idf
 
 # Needed for online_image to have enough RAM for the PNG and its decoded
 # framebuffer.
@@ -96,8 +99,8 @@ wifi:
 
 http_request:
   verify_ssl: false
-  timeout: 45s # render server can be genuinely slow, not just unreachable
-  watchdog_timeout: 240s # last-resort safety net, above awake_timeout
+  timeout: 10s # fail fast — retries handle a slow/flaky request better than waiting
+  watchdog_timeout: 120s # last-resort safety net, above awake_timeout
 
 # GPIO1 is the battery ADC, GPIO6 enables the sense divider (see Seeed's
 # Seeed_TRMNL_Eink_Project firmware — the divider reads ~0V unless GPIO6
@@ -144,7 +147,7 @@ online_image:
             - logger.log:
                 format: "image fetch failed, retrying (%d/${max_fetch_retries})"
                 args: ["id(fetch_attempt)"]
-            - delay: 3s
+            - delay: 1s
             - component.update: dashboard_image
           else:
             - logger.log: "image fetch failed too many times — sleeping, will retry next wake"
