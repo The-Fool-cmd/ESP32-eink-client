@@ -1,11 +1,13 @@
 # ESP32 dashboard client
 
 ESPHome firmware for a TRMNL-style e-ink display. Two board/panel
-combos are supported, each with its own yaml:
+combos are supported, with three yamls between them:
 
 - `trmnl-7.5in-og-diy-kit.yaml` — TRMNL 7.5" (OG) DIY Kit, monochrome.
 - `trmnl-ee04-7.3in-spectra6.yaml` — Seeed EE04 driver board + Waveshare
-  7.3" E Ink Spectra 6 (E6), full color.
+  7.3" E Ink Spectra 6 (E6), full color, landscape mount.
+- `trmnl-ee04-7.3in-spectra6-vertical.yaml` — same EE04 + Spectra 6
+  combo, for a device mounted in portrait orientation.
 
 ## How it works
 
@@ -65,6 +67,14 @@ the render server needs to serve an image already quantized to the Spectra
 no wifi, no dashboard, just static colored text drawn on boot. Useful for
 confirming the panel's wired correctly in isolation, without needing the
 render server involved at all.
+
+### `trmnl-ee04-7.3in-spectra6-vertical.yaml`
+
+Identical to `trmnl-ee04-7.3in-spectra6.yaml` — same board, panel, and
+pins — except the display is rotated 90° for a portrait mount, so the
+logical canvas is 480x800 instead of 800x480. The render server needs to
+serve a portrait-oriented image for whichever device id uses this yaml.
+If the image comes out upside down, flip `rotation` to `270` instead.
 
 ## Setup
 

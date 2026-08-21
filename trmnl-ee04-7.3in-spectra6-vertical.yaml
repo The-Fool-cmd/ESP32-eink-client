@@ -1,0 +1,195 @@
+substitutions:
+  # This device's id on the render server, set in secrets.yaml. Also
+  # doubles as the ESPHome name/hostname below, so keep it hostname-safe
+  # (lowercase letters, digits, hyphens only) — one place to rename a
+  # device instead of three.
+  device_id: !secret device_id
+  name: "trmnl-${device_id}"
+  friendly_name: "TRMNL ${device_id}"
+
+  # Render server host/port (see ESP32-eink-server).
+  render_host: "192.168.50.176"
+  render_port: "8000"
+
+  image_path: "/image/${device_id}.png"
+
+  # Time between refreshes.
+  sleep_duration: "60min"
+
+  # Max time to stay awake. Needs headroom above http_request's timeout
+  # times max_fetch_retries below, plus Wi-Fi connect, display draw time,
+  # and refresh_wait_time.
+  awake_timeout: "150s"
+
+  # Retry the image fetch this many times (same wake cycle) before giving
+  # up and waiting for the next one. Fail fast per attempt and retry rather
+  # than sit on one slow request.
+  max_fetch_retries: "3"
+
+  # epaper_spi's update() only starts the refresh — it doesn't block until
+  # the panel's actually done. This is how long to wait after triggering
+  # one before sleeping, so the refresh has time to finish.
+  refresh_wait_time: "35s"
+
+  # Extra awake time after a fresh flash/reset/power-cycle, so there's a
+  # window to reflash over USB before it goes back to sleep.
+  cold_boot_awake_time: "60s"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    then:
+      - lambda: |-
+          id(is_cold_boot) = esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
+
+globals:
+  - id: is_cold_boot
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: fetch_attempt
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+# Seeed EE04 driver board (XIAO ESP32-S3 Plus) + Waveshare 7.3" E Ink
+# Spectra 6 (E6) color panel. Pins per Seeed's EE04 ESPHome cookbook:
+# https://wiki.seeedstudio.com/EE04_with_esphome_advanced/
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Needed for online_image to have enough RAM for the PNG and its decoded
+# framebuffer — bigger here than the mono kit since this is a full-color
+# (RGB) buffer instead of 1bpp.
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true # connect straight to the known SSID, skip AP scan
+  power_save_mode: none # keep the radio fully up for the short awake window
+  on_connect:
+    # Battery sense divider is behind a load switch that's normally off —
+    # switch it on, give it a moment to settle, then read it.
+    - output.turn_on: battery_switch
+    - delay: 10ms
+    - component.update: battery_voltage
+    - output.turn_off: battery_switch
+    - logger.log:
+        level: INFO
+        format: "battery: raw ADC = %.3fV (pre-multiply), calibrated = %.1f%%"
+        args:
+          ["id(battery_voltage).get_raw_state()", "id(battery_voltage).state"]
+    - online_image.set_url:
+        id: dashboard_image
+        url: !lambda |-
+          return std::string("http://${render_host}:${render_port}${image_path}")
+              + "?battery=" + std::to_string(int(id(battery_voltage).state));
+    # On a cold boot, stay awake a bit longer instead of sleeping right
+    # after the fetch below, so there's time to reflash. Normal wake-ups
+    # skip this entirely.
+    - if:
+        condition:
+          lambda: "return id(is_cold_boot);"
+        then:
+          - deep_sleep.prevent: deep_sleep_1
+          - delay: ${cold_boot_awake_time}
+          - deep_sleep.enter: deep_sleep_1
+
+http_request:
+  verify_ssl: false
+  timeout: 10s # fail fast — retries handle a slow/flaky request better than waiting
+  watchdog_timeout: 180s # last-resort safety net, above awake_timeout
+
+# GPIO1 is the battery ADC, GPIO6 enables the sense divider — same as the
+# 7.5" OG kit. Confirmed against Seeed's EE04 pin reference (VOLTAGE_PIN
+# A0 / GPIO1, ADC_ENABLE_PIN A5 / GPIO6).
+output:
+  - platform: gpio
+    pin: GPIO6
+    id: battery_switch
+
+sensor:
+  - platform: adc
+    pin: GPIO1
+    id: battery_voltage
+    attenuation: 12db
+    update_interval: never
+    filters:
+      - multiply: 2.0
+      - calibrate_linear:
+          - 3.27 -> 0.0
+          - 4.15 -> 100.0
+      - clamp:
+          min_value: 0.0
+          max_value: 100.0
+
+online_image:
+  - id: dashboard_image
+    url: "http://${render_host}:${render_port}${image_path}"
+    format: PNG
+    type: RGB # color panel — render server must serve an image quantized
+    # to the Spectra 6 palette (black/white/red/green/blue/yellow)
+    update_interval: never # only triggered from wifi.on_connect above
+    on_download_finished:
+      - component.update: main_display
+      - delay: ${refresh_wait_time}
+      - if:
+          condition:
+            lambda: "return !id(is_cold_boot);"
+          then:
+            - deep_sleep.enter: deep_sleep_1
+    on_error:
+      - lambda: "id(fetch_attempt) += 1;"
+      - if:
+          condition:
+            lambda: "return id(fetch_attempt) <= ${max_fetch_retries};"
+          then:
+            - logger.log:
+                format: "image fetch failed, retrying (%d/${max_fetch_retries})"
+                args: ["id(fetch_attempt)"]
+            - delay: 1s
+            - component.update: dashboard_image
+          else:
+            - logger.log: "image fetch failed too many times — sleeping, will retry next wake"
+            - if:
+                condition:
+                  lambda: "return !id(is_cold_boot);"
+                then:
+                  - deep_sleep.enter: deep_sleep_1
+
+spi:
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+
+display:
+  - platform: epaper_spi
+    id: main_display
+    model: "7.3in-Spectra-E6"
+    cs_pin: GPIO44
+    dc_pin: GPIO10
+    reset_pin: GPIO38
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    # Panel is natively 800x480 (landscape); this device is mounted
+    # vertically, so rotate 90° to get a 480x800 logical canvas. The
+    # render server needs to serve a matching portrait-oriented image
+    # for this device id. Flip to 270 if the image comes out upside down.
+    rotation: 90
+    update_interval: never # only ever redrawn from online_image's callback
+    lambda: |-
+      it.image(0, 0, id(dashboard_image));
+
+deep_sleep:
+  id: deep_sleep_1
+  run_duration: ${awake_timeout}
+  sleep_duration: ${sleep_duration}
